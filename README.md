@@ -1,9 +1,10 @@
 # Webstack-Template
+```bash
 apt update && apt install -y git
 git clone https://github.com/etxshadow/webstack_setup.git
 cd webstack_setup
 bash scripts/setup-server.sh
-
+```
 
 
 Schnelles, sicheres Deployment einer Next.js + Postgres + Nginx-Webseite
