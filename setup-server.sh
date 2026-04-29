@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Webstack Bootstrap-Skript
+#  Webstack Bootstrap-Skript v2
 #  Härtet einen frischen Ubuntu-24.04-Server und installiert:
 #  - UFW Firewall, Fail2Ban, Unattended-Upgrades
-#  - SSH-Hardening (Key-only, kein Root-Login)
+#  - Optional: Neuer Sudo-User + SSH-Port-Wechsel
 #  - Docker + Docker Compose
 #  - Nginx + Certbot (Let's Encrypt)
-#  - Vorlage für deine App (Reverse Proxy zu Next.js + Postgres)
 #
 #  Verwendung (auf frischem Server, als root):
 #      bash setup-server.sh
@@ -21,39 +20,62 @@ ok()    { printf "%s[+]%s %s\n" "$GRN" "$RST" "$1"; }
 warn()  { printf "%s[!]%s %s\n" "$YLW" "$RST" "$1"; }
 fail()  { printf "%s[x]%s %s\n" "$RED" "$RST" "$1" >&2; exit 1; }
 ask()   { local p="$1" d="${2:-}" v; read -rp "$(printf "%s[?]%s %s%s: " "$YLW" "$RST" "$p" "${d:+ [$d]}")" v; echo "${v:-$d}"; }
+ask_pw() {
+    local p="$1" v1 v2
+    while true; do
+        read -rsp "$(printf "%s[?]%s %s: " "$YLW" "$RST" "$p")" v1; echo
+        read -rsp "$(printf "%s[?]%s %s (Wiederholung): " "$YLW" "$RST" "$p")" v2; echo
+        [[ "$v1" == "$v2" && -n "$v1" ]] && { echo "$v1"; return; }
+        warn "Passwörter stimmen nicht überein oder leer. Erneut."
+    done
+}
 
 [[ $EUID -eq 0 ]] || fail "Bitte als root ausführen (oder mit sudo)."
 
 # ----- Abfragen -----------------------------------------------------------
 echo "=========================================================="
-echo "  Webstack-Setup – Bootstrap-Skript"
+echo "  Webstack-Setup – Bootstrap-Skript v2"
 echo "=========================================================="
 echo
 DOMAIN=$(ask "Domain (z.B. meineseite.de)")
 [[ -n "$DOMAIN" ]] || fail "Domain ist Pflicht."
 EMAIL=$(ask "E-Mail für Let's Encrypt")
 [[ -n "$EMAIL" ]] || fail "E-Mail ist Pflicht."
-NEW_USER=$(ask "Name des neuen Sudo-Users" "deploy")
-SSH_PORT=$(ask "SSH-Port" "2222")
 APP_PORT=$(ask "Interner Port der App (Next.js)" "3000")
 INCLUDE_WWW=$(ask "Auch www.$DOMAIN absichern? (y/n)" "y")
 
+echo
+info "Optionale Härtung:"
+CREATE_USER=$(ask "Neuen Sudo-User anlegen? (y/n)" "n")
+
+NEW_USER=""
+USER_PASS=""
 PUBKEY=""
-while [[ -z "$PUBKEY" ]]; do
-    echo
-    warn "Füge jetzt deinen SSH-Public-Key ein (eine Zeile, beginnt mit ssh-ed25519/ssh-rsa)."
-    warn "Du brauchst ihn nachher, um dich noch einzuloggen — Passwort-Login wird abgeschaltet!"
-    read -rp "> " PUBKEY
-    [[ "$PUBKEY" =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-) ]] || { warn "Sieht nicht nach einem Public-Key aus. Nochmal."; PUBKEY=""; }
-done
+if [[ "$CREATE_USER" == "y" ]]; then
+    NEW_USER=$(ask "Name des neuen Sudo-Users" "deploy")
+    USER_PASS=$(ask_pw "Passwort für $NEW_USER (für sudo)")
+    while [[ -z "$PUBKEY" ]]; do
+        echo
+        warn "Füge jetzt deinen SSH-Public-Key ein (eine Zeile, ssh-ed25519/ssh-rsa)."
+        warn "Nur dieser Key kann sich nachher als $NEW_USER einloggen."
+        read -rp "> " PUBKEY
+        [[ "$PUBKEY" =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-) ]] || { warn "Sieht nicht nach einem Public-Key aus. Nochmal."; PUBKEY=""; }
+    done
+fi
+
+CHANGE_SSH_PORT=$(ask "SSH-Port ändern? (y/n)" "n")
+SSH_PORT="22"
+if [[ "$CHANGE_SSH_PORT" == "y" ]]; then
+    SSH_PORT=$(ask "Neuer SSH-Port" "2222")
+fi
 
 echo
 info "Zusammenfassung:"
-echo "  Domain:     $DOMAIN $([[ $INCLUDE_WWW == y ]] && echo "+ www.$DOMAIN")"
-echo "  E-Mail:     $EMAIL"
-echo "  User:       $NEW_USER"
-echo "  SSH-Port:   $SSH_PORT"
-echo "  App-Port:   $APP_PORT"
+echo "  Domain:          $DOMAIN $([[ $INCLUDE_WWW == y ]] && echo "+ www.$DOMAIN")"
+echo "  E-Mail:          $EMAIL"
+echo "  App-Port:        $APP_PORT"
+echo "  Neuer User:      ${NEW_USER:-(keiner – root bleibt aktiv)}"
+echo "  SSH-Port:        $SSH_PORT $([[ $CHANGE_SSH_PORT == n ]] && echo "(unverändert)")"
 echo
 CONFIRM=$(ask "Mit Setup fortfahren? (y/n)" "y")
 [[ "$CONFIRM" == "y" ]] || fail "Abgebrochen."
@@ -67,44 +89,50 @@ apt-get install -y -qq curl wget git ufw fail2ban unattended-upgrades \
     apt-listchanges ca-certificates gnupg lsb-release software-properties-common
 ok "System aktuell."
 
-# ----- 2. Sudo-User anlegen ----------------------------------------------
-if id "$NEW_USER" &>/dev/null; then
-    warn "User $NEW_USER existiert bereits – wird übersprungen."
-else
-    info "Lege User $NEW_USER an..."
-    adduser --disabled-password --gecos "" "$NEW_USER"
-    usermod -aG sudo "$NEW_USER"
-    ok "User $NEW_USER erstellt und in Sudo-Gruppe."
-fi
+# ----- 2. Sudo-User anlegen (optional) -----------------------------------
+if [[ "$CREATE_USER" == "y" ]]; then
+    if id "$NEW_USER" &>/dev/null; then
+        warn "User $NEW_USER existiert bereits – wird übersprungen."
+    else
+        info "Lege User $NEW_USER an..."
+        adduser --disabled-password --gecos "" "$NEW_USER"
+        echo "$NEW_USER:$USER_PASS" | chpasswd
+        usermod -aG sudo "$NEW_USER"
+        ok "User $NEW_USER erstellt, Passwort gesetzt, in Sudo-Gruppe."
+    fi
 
-info "SSH-Key für $NEW_USER hinterlegen..."
-mkdir -p "/home/$NEW_USER/.ssh"
-echo "$PUBKEY" > "/home/$NEW_USER/.ssh/authorized_keys"
-chmod 700 "/home/$NEW_USER/.ssh"
-chmod 600 "/home/$NEW_USER/.ssh/authorized_keys"
-chown -R "$NEW_USER:$NEW_USER" "/home/$NEW_USER/.ssh"
-ok "SSH-Key hinterlegt."
+    info "SSH-Key für $NEW_USER hinterlegen..."
+    mkdir -p "/home/$NEW_USER/.ssh"
+    echo "$PUBKEY" > "/home/$NEW_USER/.ssh/authorized_keys"
+    chmod 700 "/home/$NEW_USER/.ssh"
+    chmod 600 "/home/$NEW_USER/.ssh/authorized_keys"
+    chown -R "$NEW_USER:$NEW_USER" "/home/$NEW_USER/.ssh"
+    ok "SSH-Key hinterlegt."
+fi
 
 # ----- 3. SSH absichern --------------------------------------------------
 info "SSH härten..."
 SSHD=/etc/ssh/sshd_config.d/99-hardening.conf
-cat > "$SSHD" <<EOF
-Port $SSH_PORT
-PermitRootLogin no
-PasswordAuthentication no
-PubkeyAuthentication yes
-KbdInteractiveAuthentication no
-ChallengeResponseAuthentication no
-UsePAM yes
-X11Forwarding no
-AllowUsers $NEW_USER
-MaxAuthTries 3
-ClientAliveInterval 300
-ClientAliveCountMax 2
-EOF
+{
+    echo "Port $SSH_PORT"
+    echo "PermitRootLogin prohibit-password"   # Key-Login bleibt erlaubt
+    echo "PasswordAuthentication no"
+    echo "PubkeyAuthentication yes"
+    echo "KbdInteractiveAuthentication no"
+    echo "ChallengeResponseAuthentication no"
+    echo "UsePAM yes"
+    echo "X11Forwarding no"
+    echo "MaxAuthTries 3"
+    echo "ClientAliveInterval 300"
+    echo "ClientAliveCountMax 2"
+    if [[ "$CREATE_USER" == "y" ]]; then
+        echo "AllowUsers $NEW_USER root"
+    fi
+} > "$SSHD"
+
 sshd -t || fail "Fehler in SSH-Config!"
 systemctl restart ssh || systemctl restart sshd
-ok "SSH abgesichert (Port $SSH_PORT, nur Key-Auth, kein Root)."
+ok "SSH abgesichert (Port $SSH_PORT, nur Key-Auth)."
 
 # ----- 4. Firewall -------------------------------------------------------
 info "UFW-Firewall einrichten..."
@@ -194,8 +222,12 @@ if ! command -v docker &>/dev/null; then
         docker-buildx-plugin docker-compose-plugin
     systemctl enable --now docker
 fi
-usermod -aG docker "$NEW_USER"
-ok "Docker installiert (User $NEW_USER kann es ohne sudo nutzen)."
+if [[ "$CREATE_USER" == "y" ]]; then
+    usermod -aG docker "$NEW_USER"
+    ok "Docker installiert (User $NEW_USER kann es ohne sudo nutzen)."
+else
+    ok "Docker installiert."
+fi
 
 # ----- 9. Nginx + Certbot -----------------------------------------------
 info "Nginx und Certbot installieren..."
@@ -210,13 +242,11 @@ SERVER_NAMES="$DOMAIN"
 [[ "$INCLUDE_WWW" == "y" ]] && SERVER_NAMES="$DOMAIN www.$DOMAIN"
 
 cat > "/etc/nginx/sites-available/$DOMAIN" <<EOF
-# HTTP – wird gleich von Certbot um HTTPS-Block erweitert
 server {
     listen 80;
     listen [::]:80;
     server_name $SERVER_NAMES;
 
-    # Für ACME-Challenge (Let's Encrypt)
     location /.well-known/acme-challenge/ {
         root /var/www/html;
     }
@@ -271,10 +301,14 @@ nginx -t && systemctl reload nginx
 ok "Security-Header aktiv."
 
 # ----- 13. App-Verzeichnis anlegen ---------------------------------------
-APP_DIR="/home/$NEW_USER/app"
+if [[ "$CREATE_USER" == "y" ]]; then
+    APP_DIR="/home/$NEW_USER/app"
+else
+    APP_DIR="/root/app"
+fi
 info "App-Verzeichnis $APP_DIR anlegen..."
 mkdir -p "$APP_DIR"
-chown -R "$NEW_USER:$NEW_USER" "$APP_DIR"
+[[ "$CREATE_USER" == "y" ]] && chown -R "$NEW_USER:$NEW_USER" "$APP_DIR"
 ok "Bereit für deine App."
 
 # ----- Zusammenfassung ---------------------------------------------------
@@ -284,12 +318,17 @@ ok "Setup abgeschlossen!"
 echo "=========================================================="
 echo
 echo "Nächste Schritte:"
-echo "  1. Login testen:   ssh -p $SSH_PORT $NEW_USER@<server-ip>"
+if [[ "$CREATE_USER" == "y" ]]; then
+    echo "  1. Login testen:   ssh -p $SSH_PORT $NEW_USER@<server-ip>"
+    echo "     (Sudo-Passwort: das eben gesetzte)"
+else
+    echo "  1. Login bleibt:   ssh -p $SSH_PORT root@<server-ip>"
+fi
 echo "  2. App deployen nach $APP_DIR"
-echo "     – docker-compose.yml + Dockerfile aus dem Template kopieren"
-echo "     – 'docker compose up -d' im Verzeichnis ausführen"
 echo "  3. https://$DOMAIN im Browser öffnen"
 echo
-warn "WICHTIG: Diese SSH-Session offen lassen, bis du dich mit dem"
-warn "neuen User+Port erfolgreich neu eingeloggt hast – sonst Lockout!"
+if [[ "$CREATE_USER" == "y" ]]; then
+    warn "WICHTIG: Aktuelle SSH-Session offen lassen, bis du dich mit dem"
+    warn "neuen User+Port erfolgreich neu eingeloggt hast – sonst Lockout!"
+fi
 echo
